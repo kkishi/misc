@@ -1,6 +1,16 @@
 #!/bin/bash
 
-media=/media/keisuke/3239-3438
+for d in "3239-3438" "disk"; do
+  if [[ -d "/media/keisuke/${d}" ]]; then
+    media="/media/keisuke/${d}";
+  fi
+done
+
+if [[ $media = "" ]]; then
+  echo "SD card not found"
+  exit
+fi
+
 dir=$media/DCIM
 echo "Make sure that everything you want to copy is under $dir:"
 echo
