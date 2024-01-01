@@ -2,45 +2,51 @@ package main
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"time"
 )
 
-var addr = flag.String("addr", "", "")
+var (
+	addr    = flag.String("addr", "", "")
+	dataset = flag.String("dataset", "", "")
+)
 
-func run() error {
+func run(ctx context.Context) error {
 	// Find the previous snapshots of the source.
-	var buf bytes.Buffer
+	var snapshots []string
 	{
-		cmd := exec.Command("zfs", "list", "-t", "snapshot", "tank/photos", "-o", "name", "-H")
+		var buf bytes.Buffer
+		cmd := exec.CommandContext(ctx, "zfs", "list", "-t", "snapshot", *dataset, "-o", "name", "-H")
 		cmd.Stdout = &buf
 		cmd.Stderr = os.Stderr
 		log.Printf("command: %s\n", cmd)
 		if err := cmd.Run(); err != nil {
 			return err
 		}
-		log.Printf("existing snapshots:\n%s", buf.String())
+		snapshots = strings.Fields(buf.String())
 	}
-	snapshots := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	var prev string
 	if len(snapshots) == 0 {
-		return errors.New("no snapshot found")
+		log.Println("No previous snapshot found")
+	} else {
+		prev = snapshots[len(snapshots)-1]
+		log.Printf("Found a previous snapshot: %s\n", prev)
 	}
-	prev := snapshots[len(snapshots)-1]
-	log.Printf("Found a previous snapshot: %s\n", prev)
 
 	// Determine the name of the next snapshot.
-	next := fmt.Sprintf("tank/photos@%s", time.Now().Format("2006-01-02-15:04:05"))
+	next := *dataset + "@" + time.Now().Format("2006-01-02-15:04:05")
 	if prev == next {
 		return fmt.Errorf("previous and next snapshots have the same name (%s)", next)
 	}
 	{
-		cmd := exec.Command("sudo", "zfs", "snapshot", next)
+		cmd := exec.CommandContext(ctx, "sudo", "zfs", "snapshot", next)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		log.Printf("command: %s\n", cmd)
@@ -52,23 +58,22 @@ func run() error {
 	// The new snapshot is not useful unless the subsequent send/receive succeeds.
 	// If something goes wrong, it should be destroyed.
 	undo := true // This variable is set to false when this function succeeds.
-	defer func() error {
-		if !undo {
-			return nil
+	defer func() {
+		if undo {
+			cmd := exec.CommandContext(ctx, "sudo", "zfs", "destroy", next)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			log.Printf("command: %s\n", cmd)
+			if err := cmd.Run(); err != nil {
+				log.Printf("error destroying the snapshot %s: %v", next, err)
+				return
+			}
+			log.Printf("Destroyed the snapshot %s\n", next)
 		}
-		cmd := exec.Command("sudo", "zfs", "destroy", next)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		log.Printf("command: %s\n", cmd)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("error destroying the snapshot %s: %v", next, err)
-		}
-		log.Printf("Destroyed the snapshot %s\n", next)
-		return nil
 	}()
 
 	// Set up receive.
-	receiveCMD := exec.Command("ssh", *addr, "zfs receive -F -v tank-mirror/photos")
+	receiveCMD := exec.CommandContext(ctx, "ssh", *addr, "zfs receive -F -v "+strings.Replace(*dataset, "tank", "tank-mirror", 1))
 	receiveCMD.Stdout = os.Stdout
 	receiveCMD.Stderr = os.Stderr
 	receiveStdin, err := receiveCMD.StdinPipe()
@@ -77,7 +82,12 @@ func run() error {
 	}
 
 	// Send.
-	sendCMD := exec.Command("zfs", "send", "-v", "-i", prev, next)
+	var sendCMD *exec.Cmd
+	if prev == "" {
+		sendCMD = exec.CommandContext(ctx, "zfs", "send", "-v", next)
+	} else {
+		sendCMD = exec.CommandContext(ctx, "zfs", "send", "-v", "-i", prev, next)
+	}
 	sendCMD.Stdout = receiveStdin
 	sendCMD.Stderr = os.Stderr
 	log.Printf("command: %s\n", sendCMD)
@@ -103,7 +113,19 @@ func run() error {
 
 func main() {
 	flag.Parse()
-	if err := run(); err != nil {
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		s := <-c
+		signal.Reset(s)
+		fmt.Println(s)
+		cancel()
+	}()
+
+	if err := run(ctx); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
