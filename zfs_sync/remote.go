@@ -73,7 +73,12 @@ func run(ctx context.Context) error {
 	}()
 
 	// Set up receive.
-	receiveCMD := exec.CommandContext(ctx, "ssh", *addr, "zfs receive -F -v "+strings.Replace(*dataset, "tank", "tank-mirror", 1))
+	var receiveCMD *exec.Cmd
+	if *addr != "" {
+		receiveCMD = exec.CommandContext(ctx, "ssh", *addr, "zfs receive -F -v "+strings.Replace(*dataset, "tank", "tank-mirror", 1))
+	} else {
+		receiveCMD = exec.CommandContext(ctx, "zfs", "receive", "-F", "-v", strings.Replace(*dataset, "tank", "tank-remote", 1))
+	}
 	receiveCMD.Stdout = os.Stdout
 	receiveCMD.Stderr = os.Stderr
 	receiveStdin, err := receiveCMD.StdinPipe()
